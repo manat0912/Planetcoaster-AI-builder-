@@ -1,0 +1,8 @@
+gradio>=6.0
+requests>=2.31
+pillow>=10.0
+mss>=9.0
+pyautogui>=0.9.54
+anthropic>=0.40
+google-genai>=1.14
+openai>=1.30
