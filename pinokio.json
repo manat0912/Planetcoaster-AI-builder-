@@ -1,0 +1,12 @@
+{
+  "title": "PlanetCoaster AI Builder",
+  "description": "AI agent that reads real theme-park blueprints, maps and coaster schematics, then builds them automatically in Planet Coaster 1 & 2 via PC-level control (Claude / Gemini / OpenAI vision + PyAutoGUI).",
+  "icon": "icon.png",
+  "links": [
+    {
+      "title": "github",
+      "value": "https://github.com/manat0912/Planetcoaster-AI-builder-"
+    }
+  ],
+  "posts": []
+}

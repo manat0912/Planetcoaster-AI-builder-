@@ -1,0 +1,11 @@
+env/
+__pycache__/
+*.pyc
+config.json
+cache/
+.gradio/
+logs/*.log
+logs/*.png
+logs/*.json
+blueprints/*
+!blueprints/.gitkeep
