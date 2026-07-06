@@ -9,7 +9,7 @@ module.exports = {
           "python app.py"
         ],
         on: [{
-          "event": "/http:\/\/\\S+/",
+          "event": "/(http:\\/\\/[0-9.:]+)/",
           "done": true
         }]
       }
@@ -17,7 +17,7 @@ module.exports = {
     {
       method: "local.set",
       params: {
-        url: "{{input.event[0]}}"
+        url: "{{input.event[1]}}"
       }
     }
   ]

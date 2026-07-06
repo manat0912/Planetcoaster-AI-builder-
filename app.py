@@ -228,7 +228,7 @@ known ground positions in your park (in units) and where they appear on screen
             )
 
         # ── Settings ─────────────────────────────────────────────────────────
-        with gr.Tab("Settings"):
+        with gr.Tab("Settings") as settings_tab:
             gr.Markdown("### Model provider")
             provider = gr.Dropdown(
                 choices=list(PROVIDER_MODELS.keys()),
@@ -254,7 +254,7 @@ known ground positions in your park (in units) and where they appear on screen
                 inputs=[provider, model, anthropic_key, gemini_key, openai_key, openai_base],
                 outputs=save_status,
             )
-            demo.load(
+            settings_tab.select(
                 load_settings,
                 outputs=[provider, model, anthropic_key, gemini_key, openai_key, openai_base],
             )
@@ -287,4 +287,4 @@ known ground positions in your park (in units) and where they appear on screen
 """)
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, css=CSS)
+    demo.launch(server_name="127.0.0.1", server_port=7860, css=CSS)
