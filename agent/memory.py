@@ -21,6 +21,7 @@ class AgentMemory:
         self.plan: list[dict[str, Any]] | None = None
         self.actions: list[dict[str, Any]] = []
         self.lines: list[str] = []
+        self.state_file = LOG_DIR.parent / "cache" / "last_build_state.json"
 
     # ── state ────────────────────────────────────────────────────────────────
     def save_layout(self, layout: dict[str, Any]) -> None:
@@ -31,6 +32,34 @@ class AgentMemory:
 
     def save_plan(self, plan: list[dict[str, Any]]) -> None:
         self.plan = plan
+
+    def save_state(self, index: int) -> None:
+        """Save progress state to cache folder."""
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(json.dumps({
+            "layout": self.layout,
+            "ingame_dims": self.ingame_dims,
+            "plan": self.plan,
+            "current_index": index,
+            "timestamp": time.time()
+        }, indent=2))
+
+    def load_state(self) -> dict[str, Any] | None:
+        """Load progress state from cache folder."""
+        if not self.state_file.exists():
+            return None
+        try:
+            return json.loads(self.state_file.read_text())
+        except Exception:
+            return None
+
+    def clear_state(self) -> None:
+        """Remove progress state file."""
+        if self.state_file.exists():
+            try:
+                self.state_file.unlink()
+            except Exception:
+                pass
 
     def log_action(self, action: dict[str, Any]) -> None:
         self.actions.append(action)

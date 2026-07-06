@@ -48,6 +48,9 @@ ACTION_TYPES = {
     "wait": {"seconds"},
     "screenshot": set(),
     "note": {"text"},
+    "pan_camera": {"direction"},
+    "zoom_camera": {"direction"},
+    "delete_object": set(),
 }
 
 

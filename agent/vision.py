@@ -7,7 +7,9 @@ single normalized JSON layout. All spatial coordinates are normalized to 0..1
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
+from PIL import Image
 
 from .model import call_model
 from .schema import empty_layout, validate_layout
@@ -60,6 +62,34 @@ Rules:
 """
 
 
+def _validate_image(path: str) -> None:
+    path_obj = Path(path)
+    if not path_obj.exists():
+        raise ValueError(f"Image file not found: {path}")
+
+    # Read first few bytes to check if it's a PDF
+    try:
+        with open(path, "rb") as f:
+            header = f.read(4)
+            if header == b"%PDF":
+                raise ValueError(
+                    f"File '{path_obj.name}' is a PDF document, not a supported image format. "
+                    "Please convert your PDF pages to PNG or JPEG images before uploading."
+                )
+    except OSError:
+        pass
+
+    # Verify standard image formatting using PIL
+    try:
+        with Image.open(path) as img:
+            img.verify()
+    except Exception:
+        raise ValueError(
+            f"File '{path_obj.name}' could not be identified as a valid image. "
+            "Please ensure it is a valid PNG, JPEG, or WebP image."
+        )
+
+
 def extract_layout(
     image_paths: list[str],
     cfg: dict[str, Any] | None = None,
@@ -68,6 +98,9 @@ def extract_layout(
     """Run the vision model over *image_paths* and return a validated layout dict."""
     if not image_paths:
         raise ValueError("No blueprint images provided.")
+
+    for path in image_paths:
+        _validate_image(path)
 
     prompt = PROMPT
     if real_park_prompt:

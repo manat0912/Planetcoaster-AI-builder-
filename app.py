@@ -21,9 +21,155 @@ from agent import dimensions, planner, vision
 from agent.controller import ControllerConfig, WorldProjector, execute_plan
 from agent.memory import AgentMemory
 from agent.model import PROVIDER_MODELS, load_config, save_config
+from agent.controls import scan_game_directory, PC2_DEFAULTS
 
 BLUEPRINT_DIR = Path(__file__).resolve().parent / "blueprints"
 BLUEPRINT_DIR.mkdir(exist_ok=True)
+
+
+def run_scan_folder(folder_path):
+    res = scan_game_directory(folder_path)
+    status_md = f"### Scan Results\n- **Status**: {res['status']}\n- **Detected Game**: {res['game_version']}\n"
+    if res['config_files_found']:
+        status_md += f"- **Config Files Found**:\n"
+        for f in res['config_files_found']:
+            status_md += f"  - `{f}`\n"
+    
+    ctrls = res['controls']
+    return (
+        status_md,
+        res['game_version'],
+        ctrls.get("camera_move_forward", "w"),
+        ctrls.get("camera_move_backward", "s"),
+        ctrls.get("camera_move_left", "a"),
+        ctrls.get("camera_move_right", "d"),
+        ctrls.get("camera_zoom_in", "pageup"),
+        ctrls.get("camera_zoom_out", "pagedown"),
+        ctrls.get("menu_terrain", "t"),
+        ctrls.get("menu_paths", "p"),
+        ctrls.get("menu_scenery", "b"),
+        ctrls.get("menu_coasters", "r"),
+        ctrls.get("menu_rides", "y"),
+        ctrls.get("delete_object", "delete"),
+        ctrls.get("place_object", "left_click"),
+        ctrls.get("cancel_action", "escape"),
+        ctrls.get("rotate_object", "z"),
+        ctrls.get("height_adj", "shift"),
+    )
+
+
+def save_custom_keybinds(
+    folder_path, game_version, forward, backward, left, right, zoom_in, zoom_out,
+    terrain, paths, scenery, coasters, rides, delete_obj, place_obj, cancel, rotate, height_adj
+):
+    cfg = load_config()
+    controls_dict = {
+        "camera_move_forward": forward,
+        "camera_move_backward": backward,
+        "camera_move_left": left,
+        "camera_move_right": right,
+        "camera_zoom_in": zoom_in,
+        "camera_zoom_out": zoom_out,
+        "menu_terrain": terrain,
+        "menu_paths": paths,
+        "menu_scenery": scenery,
+        "menu_coasters": coasters,
+        "menu_rides": rides,
+        "delete_object": delete_obj,
+        "place_object": place_obj,
+        "cancel_action": cancel,
+        "rotate_object": rotate,
+        "height_adj": height_adj,
+    }
+    cfg["game_folder"] = folder_path
+    cfg["game_version"] = game_version
+    cfg["controls"] = controls_dict
+    save_config(cfg)
+    return "Custom controls and keybinds saved successfully to config.json."
+
+
+def load_controls_ui():
+    cfg = load_config()
+    folder_path = cfg.get("game_folder", "")
+    game_version = cfg.get("game_version", "Planet Coaster 2")
+    ctrls = cfg.get("controls", {})
+    if not ctrls:
+        ctrls = dict(PC2_DEFAULTS)
+        
+    return (
+        folder_path,
+        game_version,
+        ctrls.get("camera_move_forward", "w"),
+        ctrls.get("camera_move_backward", "s"),
+        ctrls.get("camera_move_left", "a"),
+        ctrls.get("camera_move_right", "d"),
+        ctrls.get("camera_zoom_in", "pageup"),
+        ctrls.get("camera_zoom_out", "pagedown"),
+        ctrls.get("menu_terrain", "t"),
+        ctrls.get("menu_paths", "p"),
+        ctrls.get("menu_scenery", "b"),
+        ctrls.get("menu_coasters", "r"),
+        ctrls.get("menu_rides", "y"),
+        ctrls.get("delete_object", "delete"),
+        ctrls.get("place_object", "left_click"),
+        ctrls.get("cancel_action", "escape"),
+        ctrls.get("rotate_object", "z"),
+        ctrls.get("height_adj", "shift"),
+    )
+
+
+def check_resume_status():
+    memory = AgentMemory()
+    state = memory.load_state()
+    if not state:
+        return "No saved build in cache. Start a new build below."
+    plan_len = len(state.get("plan", []))
+    idx = state.get("current_index", 0)
+    timestamp = state.get("timestamp", 0)
+    import datetime
+    time_str = datetime.datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+    return f"**Saved Build State**: Step **{idx}** of **{plan_len}** (Saved: {time_str}). Ready to resume!"
+
+
+def run_resume_build(dry_run, ax, ay, aux, auy, bx, by, bux, buy, action_delay):
+    memory = AgentMemory()
+    state = memory.load_state()
+    if not state:
+        return "No saved build progress found to resume. Please generate a new plan and build."
+    
+    plan = state.get("plan")
+    start_index = state.get("current_index", 0)
+    layout = state.get("layout", {})
+    dims = state.get("ingame_dims", {})
+    
+    if not plan:
+        return "Loaded state has no build plan."
+        
+    memory.save_layout(layout)
+    memory.save_dims(dims)
+    memory.save_plan(plan)
+    
+    projector = WorldProjector(
+        unit_a=(float(aux), float(auy)), screen_a=(int(ax), int(ay)),
+        unit_b=(float(bux), float(buy)), screen_b=(int(bx), int(by)),
+    )
+    
+    cfg = load_config()
+    custom_controls = cfg.get("controls", {})
+    if custom_controls:
+        config = ControllerConfig(
+            dry_run=bool(dry_run),
+            action_delay=float(action_delay),
+            projector=projector,
+            controls=custom_controls
+        )
+    else:
+        config = ControllerConfig(dry_run=bool(dry_run), action_delay=float(action_delay), projector=projector)
+        
+    memory.log(f"[resume] starting from step #{start_index} (of {len(plan)})")
+    summary = execute_plan(plan, memory=memory, config=config, log=memory.log, start_index=start_index)
+    header = f"RESUMED DRY RUN (starting from step {start_index}) - " if dry_run else f"RESUMED LIVE BUILD (starting from step {start_index}) - "
+    return header + json.dumps(summary) + "\n\n" + memory.text_log()
 
 
 # ── settings ─────────────────────────────────────────────────────────────────
@@ -108,18 +254,32 @@ def run_plan(layout, dims, plan_mode):
         return None, f"Planning failed: {exc}"
 
 
-def run_build(plan, dry_run, ax, ay, aux, auy, bx, by, bux, buy, action_delay):
+def run_build(plan, layout, dims, dry_run, ax, ay, aux, auy, bx, by, bux, buy, action_delay):
     if not plan:
         return "Generate a plan first."
     memory = AgentMemory()
+    memory.save_layout(layout or {})
+    memory.save_dims(dims or {})
+    memory.save_plan(plan or [])
     projector = WorldProjector(
         unit_a=(float(aux), float(auy)), screen_a=(int(ax), int(ay)),
         unit_b=(float(bux), float(buy)), screen_b=(int(bx), int(by)),
     )
-    config = ControllerConfig(dry_run=bool(dry_run), action_delay=float(action_delay), projector=projector)
+    cfg = load_config()
+    custom_controls = cfg.get("controls", {})
+    if custom_controls:
+        config = ControllerConfig(
+            dry_run=bool(dry_run),
+            action_delay=float(action_delay),
+            projector=projector,
+            controls=custom_controls
+        )
+    else:
+        config = ControllerConfig(dry_run=bool(dry_run), action_delay=float(action_delay), projector=projector)
     summary = execute_plan(plan, memory=memory, config=config, log=memory.log)
     header = "DRY RUN (no input sent) - " if dry_run else "LIVE BUILD - "
     return header + json.dumps(summary) + "\n\n" + memory.text_log()
+
 
 
 # ── UI ───────────────────────────────────────────────────────────────────────
@@ -142,7 +302,7 @@ with gr.Blocks(title="PlanetCoaster AI Builder") as demo:
 
     with gr.Tabs():
         # ── Build ────────────────────────────────────────────────────────────
-        with gr.Tab("Build"):
+        with gr.Tab("Build") as build_tab:
             with gr.Row():
                 with gr.Column(scale=1):
                     gr.Markdown("### 1. Blueprints")
@@ -191,7 +351,10 @@ with gr.Blocks(title="PlanetCoaster AI Builder") as demo:
             with gr.Row():
                 dry_run = gr.Checkbox(value=True, label="Dry run (recommended)")
                 action_delay = gr.Number(value=0.35, label="Delay between actions (s)")
-            build_btn = gr.Button("4. Build", variant="primary")
+            with gr.Row():
+                build_btn = gr.Button("4. Build", variant="primary", scale=2)
+                resume_btn = gr.Button("Resume Last Build", variant="secondary", scale=1)
+            resume_status = gr.Markdown("### Resume Status\nChecking saved build cache...")
             build_out = gr.Textbox(label="Build log", lines=16)
 
             # wiring
@@ -228,8 +391,95 @@ known ground positions in your park (in units) and where they appear on screen
 
             build_btn.click(
                 run_build,
-                inputs=[plan_state, dry_run, ax, ay, aux, auy, bx, by, bux, buy, action_delay],
+                inputs=[plan_state, layout_state, dims_state, dry_run, ax, ay, aux, auy, bx, by, bux, buy, action_delay],
                 outputs=[build_out],
+            ).then(check_resume_status, outputs=resume_status)
+
+            resume_btn.click(
+                run_resume_build,
+                inputs=[dry_run, ax, ay, aux, auy, bx, by, bux, buy, action_delay],
+                outputs=[build_out],
+            ).then(check_resume_status, outputs=resume_status)
+        # ── Controls & Scanner ───────────────────────────────────────────────
+        with gr.Tab("Controls & Scanner") as controls_tab:
+            gr.Markdown("### Game Folder & Controls Scanner")
+            gr.Markdown(
+                "Point the scanner to your game installation directory or your Saved Games settings folder. "
+                "The agent will automatically identify the game version (Planet Coaster 1 vs 2) and parse "
+                "any control binding configuration XMLs (e.g. `Controls_remote.config.xml`)."
+            )
+            with gr.Row():
+                game_folder = gr.Textbox(
+                    label="Game Folder or Saved Games Config Path",
+                    placeholder="e.g. C:\\Users\\[Username]\\Saved Games\\Frontier Developments\\Planet Coaster 2",
+                    scale=4
+                )
+                scan_btn = gr.Button("Scan Game Folder", variant="primary", scale=1)
+                
+            scan_status = gr.Markdown("### Scan Results\n- **Status**: Not scanned yet.\n- **Detected Game**: Planet Coaster 2 (Default)")
+            
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("#### Camera Mappings")
+                    ctrl_game_version = gr.Textbox(label="Detected Game Version", value="Planet Coaster 2", interactive=False)
+                    ctrl_forward = gr.Textbox(label="Move Forward", value="w")
+                    ctrl_backward = gr.Textbox(label="Move Backward", value="s")
+                    ctrl_left = gr.Textbox(label="Move Left", value="a")
+                    ctrl_right = gr.Textbox(label="Move Right", value="d")
+                    ctrl_zoom_in = gr.Textbox(label="Zoom In", value="pageup")
+                    ctrl_zoom_out = gr.Textbox(label="Zoom Out", value="pagedown")
+                with gr.Column():
+                    gr.Markdown("#### Build Menu Mappings")
+                    ctrl_terrain = gr.Textbox(label="Terrain Menu", value="t")
+                    ctrl_paths = gr.Textbox(label="Paths Menu", value="p")
+                    ctrl_scenery = gr.Textbox(label="Scenery/Build Menu", value="b")
+                    ctrl_coasters = gr.Textbox(label="Coasters Menu", value="r")
+                    ctrl_rides = gr.Textbox(label="Rides Menu", value="y")
+                with gr.Column():
+                    gr.Markdown("#### Object Actions")
+                    ctrl_delete = gr.Textbox(label="Delete Object", value="delete")
+                    ctrl_place = gr.Textbox(label="Place Object (Mouse)", value="left_click")
+                    ctrl_cancel = gr.Textbox(label="Cancel/Deselect", value="escape")
+                    ctrl_rotate = gr.Textbox(label="Rotate Object", value="z")
+                    ctrl_height = gr.Textbox(label="Adjust Height", value="shift")
+                    
+            save_ctrl_btn = gr.Button("Save Keybind Mappings", variant="primary")
+            save_ctrl_status = gr.Textbox(label="", interactive=False, show_label=False)
+
+            # Scan wiring
+            scan_btn.click(
+                run_scan_folder,
+                inputs=[game_folder],
+                outputs=[
+                    scan_status, ctrl_game_version,
+                    ctrl_forward, ctrl_backward, ctrl_left, ctrl_right,
+                    ctrl_zoom_in, ctrl_zoom_out,
+                    ctrl_terrain, ctrl_paths, ctrl_scenery, ctrl_coasters, ctrl_rides,
+                    ctrl_delete, ctrl_place, ctrl_cancel, ctrl_rotate, ctrl_height
+                ]
+            )
+            # Save wiring
+            save_ctrl_btn.click(
+                save_custom_keybinds,
+                inputs=[
+                    game_folder, ctrl_game_version,
+                    ctrl_forward, ctrl_backward, ctrl_left, ctrl_right,
+                    ctrl_zoom_in, ctrl_zoom_out,
+                    ctrl_terrain, ctrl_paths, ctrl_scenery, ctrl_coasters, ctrl_rides,
+                    ctrl_delete, ctrl_place, ctrl_cancel, ctrl_rotate, ctrl_height
+                ],
+                outputs=[save_ctrl_status]
+            )
+            # Tab selection load wiring
+            controls_tab.select(
+                load_controls_ui,
+                outputs=[
+                    game_folder, ctrl_game_version,
+                    ctrl_forward, ctrl_backward, ctrl_left, ctrl_right,
+                    ctrl_zoom_in, ctrl_zoom_out,
+                    ctrl_terrain, ctrl_paths, ctrl_scenery, ctrl_coasters, ctrl_rides,
+                    ctrl_delete, ctrl_place, ctrl_cancel, ctrl_rotate, ctrl_height
+                ]
             )
 
         # ── Settings ─────────────────────────────────────────────────────────
@@ -290,6 +540,9 @@ known ground positions in your park (in units) and where they appear on screen
 - **Gemini**: https://aistudio.google.com/apikey
 - **OpenAI**: https://platform.openai.com/api-keys
 """)
+
+    demo.load(check_resume_status, outputs=resume_status)
+    build_tab.select(check_resume_status, outputs=resume_status)
 
 if __name__ == "__main__":
     demo.launch(server_name="127.0.0.1", server_port=7860, css=CSS)
