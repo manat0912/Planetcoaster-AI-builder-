@@ -46,6 +46,17 @@ Convert every normalized coordinate to in-game UNITS with:
     unit_y = origin_y + norm_y * {fit_h:.2f}
     unit_z = norm_z * {fit_w:.2f}
 
+{guidance_section}
+
+Scaling & Fidelity Instructions:
+- The real park dimensions are {real_w:.1f}m x {real_h:.1f}m.
+- The in-game buildable area is {build_w_m:.1f}m x {build_h_m:.1f}m.
+- The build is scaled down by a factor of {scale_ratio:.4f} relative to the real park.
+- To make the scaled-down build look as close as possible to the real park, make sure to adjust/approximate where needed:
+  1. Paths: Keep them usable (minimum width in-game is usually 4m / 1.0 unit). If path width scales down below 4m, clamp/set it to at least 4m.
+  2. Spacing: Ensure buildings, rides, and coaster tracks have sufficient spacing so they do not clip or overlap.
+  3. Coasters: Scale track node coordinates, but avoid making track elements or turns too tight or short, as game clearance limits require smooth shapes. Adjust the banking and heights to keep it looking realistic.
+
 Emit actions in this build order: terrain, then paths, then buildings, then
 coaster track, then rides/theming. Use ONLY these action objects:
 
@@ -97,6 +108,19 @@ def generate_plan(
     s = compute_scale(layout, ingame)
     import json
 
+    real_w = float(layout.get("width_meters") or 0) or 1.0
+    real_h = float(layout.get("height_meters") or 0) or 1.0
+    mpu = float(ingame["meters_per_unit"])
+    build_w_m = ingame["width_units"] * mpu
+    build_h_m = ingame["height_units"] * mpu
+    scale_ratio = min(build_w_m / real_w, build_h_m / real_h)
+
+    real_park_prompt = layout.get("real_park_prompt")
+    if real_park_prompt:
+        guidance_section = f"USER SCALE & DIMENSIONS GUIDANCE:\n{real_park_prompt}\n"
+    else:
+        guidance_section = ""
+
     prompt = PROMPT_TEMPLATE.format(
         layout=json.dumps(layout, indent=2),
         width_units=ingame["width_units"],
@@ -107,6 +131,12 @@ def generate_plan(
         origin_y=s["origin_y"],
         fit_w=s["fit_w"],
         fit_h=s["fit_h"],
+        real_w=real_w,
+        real_h=real_h,
+        build_w_m=build_w_m,
+        build_h_m=build_h_m,
+        scale_ratio=scale_ratio,
+        guidance_section=guidance_section,
     )
     plan = call_model(prompt, system=SYSTEM, expect_json=True, cfg=cfg)
     problems = validate_plan(plan)

@@ -71,12 +71,12 @@ def _save_uploads(files) -> list[str]:
     return paths
 
 
-def run_extract(files):
+def run_extract(files, real_park_prompt):
     try:
         paths = _save_uploads(files)
         if not paths:
             return None, "Upload at least one blueprint / map / schematic image first."
-        layout = vision.extract_layout(paths)
+        layout = vision.extract_layout(paths, real_park_prompt=real_park_prompt)
         return layout, json.dumps(layout, indent=2)
     except Exception as exc:
         return None, f"Extraction failed: {exc}\n\n{traceback.format_exc()}"
@@ -151,6 +151,11 @@ with gr.Blocks(title="PlanetCoaster AI Builder") as demo:
                         file_count="multiple",
                         file_types=["image"],
                     )
+                    real_park_prompt = gr.Textbox(
+                        label="Real-world scale & dimensions prompt / guidance (optional)",
+                        placeholder="e.g., 'The real park is 1200 meters wide by 800 meters high. The main entrance is on the south side.'",
+                        lines=3,
+                    )
                     extract_btn = gr.Button("1. Extract layout", variant="primary")
 
                     gr.Markdown("### 2. In-game area")
@@ -190,7 +195,7 @@ with gr.Blocks(title="PlanetCoaster AI Builder") as demo:
             build_out = gr.Textbox(label="Build log", lines=16)
 
             # wiring
-            extract_btn.click(run_extract, inputs=[files], outputs=[layout_state, layout_out])
+            extract_btn.click(run_extract, inputs=[files, real_park_prompt], outputs=[layout_state, layout_out])
             scan_btn.click(
                 run_scan,
                 inputs=[dim_mode, width_units, height_units, meters_per_unit],

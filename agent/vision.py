@@ -60,12 +60,20 @@ Rules:
 """
 
 
-def extract_layout(image_paths: list[str], cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+def extract_layout(
+    image_paths: list[str],
+    cfg: dict[str, Any] | None = None,
+    real_park_prompt: str | None = None,
+) -> dict[str, Any]:
     """Run the vision model over *image_paths* and return a validated layout dict."""
     if not image_paths:
         raise ValueError("No blueprint images provided.")
 
-    layout = call_model(PROMPT, images=image_paths, system=SYSTEM, expect_json=True, cfg=cfg)
+    prompt = PROMPT
+    if real_park_prompt:
+        prompt += f"\n\nUse the following user-provided scale, dimensions, or layout guidance for this park:\n{real_park_prompt}\n"
+
+    layout = call_model(prompt, images=image_paths, system=SYSTEM, expect_json=True, cfg=cfg)
 
     problems = validate_layout(layout)
     if problems:
@@ -74,4 +82,5 @@ def extract_layout(image_paths: list[str], cfg: dict[str, Any] | None = None) ->
     # normalize missing keys so downstream code can rely on them
     base = empty_layout()
     base.update({k: v for k, v in layout.items() if v is not None})
+    base["real_park_prompt"] = real_park_prompt
     return base
