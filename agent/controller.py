@@ -83,6 +83,56 @@ def _pyautogui():
     return pyautogui
 
 
+def _focus_window_by_title(target_title: str) -> bool:
+    try:
+        import ctypes
+        
+        # Callback type definition
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        
+        # Win32 APIs
+        EnumWindows = ctypes.windll.user32.EnumWindows
+        GetWindowTextW = ctypes.windll.user32.GetWindowTextW
+        GetWindowTextLengthW = ctypes.windll.user32.GetWindowTextLengthW
+        IsWindowVisible = ctypes.windll.user32.IsWindowVisible
+        ShowWindow = ctypes.windll.user32.ShowWindow
+        SetForegroundWindow = ctypes.windll.user32.SetForegroundWindow
+        
+        found_hwnds = []
+        
+        def enum_windows_callback(hwnd, lParam):
+            if IsWindowVisible(hwnd):
+                length = GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    GetWindowTextW(hwnd, buf, length + 1)
+                    title = buf.value
+                    if target_title.lower() in title.lower():
+                        found_hwnds.append(hwnd)
+            return True
+        
+        EnumWindows(WNDENUMPROC(enum_windows_callback), 0)
+        
+        if found_hwnds:
+            hwnd = found_hwnds[0]
+            # 9 = SW_RESTORE (restores window)
+            ShowWindow(hwnd, 9)
+            SetForegroundWindow(hwnd)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def focus_game_window(log: Callable[[str], None] | None = None) -> bool:
+    log = log or (lambda _msg: None)
+    for title in ("Planet Coaster 2", "Planet Coaster"):
+        log(f"[focus] Looking for window matching: '{title}'")
+        if _focus_window_by_title(title):
+            return True
+    return False
+
+
 def execute_plan(
     plan: list[dict[str, Any]],
     memory: Any = None,
@@ -98,6 +148,26 @@ def execute_plan(
 
     gui = None if config.dry_run else _pyautogui()
     proj = config.projector
+
+    if not config.dry_run:
+        # Focus game window before running plan
+        try:
+            import platform
+            if platform.system() == "Windows":
+                log("[focus] Live build started! Bringing Planet Coaster window to foreground...")
+                focused = focus_game_window(log)
+                if focused:
+                    log("[focus] Window focused successfully. Starting build in 3.0s...")
+                    time.sleep(3.0)
+                else:
+                    log("[focus] Warning: Could not find game window. Starting in 3.0s anyway, please select it manually!")
+                    time.sleep(3.0)
+            else:
+                log("[focus] Non-Windows OS. Starting build in 3.0s, please select game window manually!")
+                time.sleep(3.0)
+        except Exception as exc:
+            log(f"[focus] Error focusing window: {exc}. Starting in 3.0s...")
+            time.sleep(3.0)
 
     executed = skipped = errors = 0
 
