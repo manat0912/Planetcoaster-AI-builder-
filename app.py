@@ -12,6 +12,7 @@ keyboard when you turn OFF dry-run AND Planet Coaster is the focused window.
 from __future__ import annotations
 
 import json
+import os
 import traceback
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from agent.controller import ControllerConfig, WorldProjector, execute_plan
 from agent.memory import AgentMemory
 from agent.model import PROVIDER_MODELS, load_config, save_config
 from agent.controls import scan_game_directory, PC2_DEFAULTS
+from agent import autonomous as _autonomous
 
 BLUEPRINT_DIR = Path(__file__).resolve().parent / "blueprints"
 BLUEPRINT_DIR.mkdir(exist_ok=True)
@@ -281,8 +283,73 @@ def run_build(plan, layout, dims, dry_run, ax, ay, aux, auy, bx, by, bux, buy, a
     return header + json.dumps(summary) + "\n\n" + memory.text_log()
 
 
+# ── Autonomous agent ──────────────────────────────────────────────────────────
+_auto_stop_flag = [False]  # mutable flag passed to the agent
 
-# ── UI ───────────────────────────────────────────────────────────────────────
+
+def run_autonomous_agent(reference_files, dry_run_auto, max_iter, model_name):
+    """Launch the autonomous agent from the Gradio UI."""
+    _auto_stop_flag[0] = False
+    cfg = load_config()
+    gemini_key = cfg.get("gemini_api_key", "") or os.environ.get("GEMINI_API_KEY", "")
+    if not gemini_key:
+        yield "❌ No Gemini API key found. Set it in the Settings tab first."
+        return
+
+    ref_path = None
+    if reference_files:
+        src = Path(reference_files[0].name if hasattr(reference_files[0], "name") else reference_files[0])
+        dst = BLUEPRINT_DIR / src.name
+        dst.write_bytes(src.read_bytes())
+        ref_path = str(dst)
+
+    lines = []
+
+    def _log(msg):
+        lines.append(msg)
+
+    def _stop():
+        return _auto_stop_flag[0]
+
+    yield f"🤖 Starting autonomous agent (dry_run={dry_run_auto}, model={model_name})…\n"
+
+    import threading
+
+    result = {"summary": ""}
+
+    def _run():
+        result["summary"] = _autonomous.run_autonomous(
+            reference_image=ref_path,
+            gemini_api_key=gemini_key,
+            gemini_model=model_name or "gemini-2.5-flash",
+            dry_run=bool(dry_run_auto),
+            max_iterations=int(max_iter or 200),
+            log=_log,
+            stop=_stop,
+        )
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+    # Stream log lines while the thread runs
+    last_len = 0
+    while t.is_alive():
+        import time as _time
+        _time.sleep(0.5)
+        if len(lines) > last_len:
+            yield "\n".join(lines[last_len:])
+            last_len = len(lines)
+
+    t.join()
+    yield "\n".join(lines[last_len:])
+    yield f"\n\n✅ Done.\n{result['summary']}"
+
+
+def stop_autonomous_agent():
+    _auto_stop_flag[0] = True
+    return "⏹ Stop signal sent. Agent will halt after current action."
+
+
 CSS = """
 .main-title { text-align:center; margin-bottom:0.1em; }
 .sub-title  { text-align:center; color:#666; margin-top:0; margin-bottom:1em; }
@@ -485,15 +552,20 @@ known ground positions in your park (in units) and where they appear on screen
         # ── Settings ─────────────────────────────────────────────────────────
         with gr.Tab("Settings") as settings_tab:
             gr.Markdown("### Model provider")
+            _init_cfg = load_config()
+            _init_provider = _init_cfg.get("provider", "Anthropic Claude")
+            _init_model = _init_cfg.get("model") or (PROVIDER_MODELS.get(_init_provider) or [""])[0]
             provider = gr.Dropdown(
                 choices=list(PROVIDER_MODELS.keys()),
-                value="Anthropic Claude",
+                value=_init_provider,
                 label="Provider",
+                allow_custom_value=True,
             )
             model = gr.Dropdown(
-                choices=PROVIDER_MODELS["Anthropic Claude"],
-                value=PROVIDER_MODELS["Anthropic Claude"][0],
+                choices=PROVIDER_MODELS.get(_init_provider, PROVIDER_MODELS["Anthropic Claude"]),
+                value=_init_model,
                 label="Model",
+                allow_custom_value=True,
             )
             gr.Markdown("### API keys (stored locally in config.json)")
             anthropic_key = gr.Textbox(label="Anthropic API key", type="password")
@@ -513,6 +585,73 @@ known ground positions in your park (in units) and where they appear on screen
                 load_settings,
                 outputs=[provider, model, anthropic_key, gemini_key, openai_key, openai_base],
             )
+
+        # ── Autonomous Agent ────────────────────────────────────────────────
+        with gr.Tab("🤖 Autonomous Agent"):
+            gr.Markdown("""
+## Fully autonomous build mode
+Gemini sees the live game screen and a reference image (real park photo or
+blueprint). It decides **on its own** when to sculpt terrain up/down, paint
+textures, add water, search assets, place objects, and move to the next area.
+No operator input is needed once the agent starts.
+
+> **⚠️ Safety**: Press **ESC** or **Q** in game at any time to instantly halt.
+> Always start with **Dry run ON** to verify the agent's decisions before
+> letting it touch the keyboard/mouse for real.
+            """)
+            with gr.Row():
+                with gr.Column(scale=1):
+                    auto_ref = gr.File(
+                        label="Reference image (real park photo / blueprint)",
+                        file_count="multiple",
+                        file_types=["image"],
+                    )
+                    auto_dry = gr.Checkbox(value=True, label="🔒 Dry run (log only — no real input)")
+                    auto_iter = gr.Number(value=200, label="Max iterations (safety cap)")
+                    _auto_models = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"]
+                    auto_model = gr.Dropdown(
+                        choices=_auto_models,
+                        value="gemini-2.5-flash",
+                        label="Gemini model",
+                        allow_custom_value=True,
+                    )
+                    with gr.Row():
+                        auto_start = gr.Button("▶️ Start Autonomous Build", variant="primary", scale=2)
+                        auto_stop  = gr.Button("⏹ Stop", variant="stop", scale=1)
+                    auto_stop_status = gr.Textbox(label="", interactive=False, show_label=False)
+
+                with gr.Column(scale=2):
+                    gr.Markdown("### Live agent log")
+                    auto_log = gr.Textbox(
+                        label="Agent decisions & actions",
+                        lines=30,
+                        max_lines=60,
+                        autoscroll=True,
+                    )
+
+            gr.Markdown("""
+### How the autonomous agent works
+| Phase | What Gemini decides |
+|---|---|
+| `TERRAIN_SCULPT` | Which tool (push up/down/flatten/smooth), where to drag, spiral vs sinusoidal pattern |
+| `TERRAIN_PAINT` | Which texture (grass/sand/dirt/rock/cobblestone…) and where to paint it |
+| `TERRAIN_WATER` | Where to place water bodies with a spiral drag |
+| `ASSET_SEARCH` | What keyword to search in the Scenery/Building tabs |
+| `OBJECT_PLACEMENT` | Where to drop the selected piece, how many times to rotate it, elevation |
+| `MAP_NAVIGATE` | Which WASD direction to pan, how long, and whether to zoom in or out |
+
+After each action Gemini re-evaluates the screen. When it decides the current
+zone is finished (`status: AREA_FINISHED`) the agent does a cinematic audit
+swoop, marks the sector complete in the spatial memory grid, and pans to the
+next empty sector automatically.
+            """)
+
+            auto_start.click(
+                run_autonomous_agent,
+                inputs=[auto_ref, auto_dry, auto_iter, auto_model],
+                outputs=[auto_log],
+            )
+            auto_stop.click(stop_autonomous_agent, outputs=[auto_stop_status])
 
         # ── Help ─────────────────────────────────────────────────────────────
         with gr.Tab("Help"):

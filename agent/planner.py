@@ -15,6 +15,7 @@ All output coordinates are in in-game units, centered inside the buildable area.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from .model import call_model
@@ -25,7 +26,12 @@ SYSTEM = (
     "park layout into an ordered list of concrete in-game build actions using only "
     "the documented action vocabulary. You respect the provided uniform scale "
     "factor and buildable bounds so nothing is placed outside the park. You output "
-    "JSON only."
+    "JSON only. "
+    "CRITICAL: You must use the built-in assets, generic building/scenery pieces, "
+    "and ride/coaster types already built into the game (e.g. 'Castle Wall', 'Adventure Roof', "
+    "'Drop Tower', 'Steel Coaster') instead of inventing custom names like 'Hogwarts Castle' or "
+    "'Jurassic Park Discovery Center'. When selecting menus, use the exact menu names: "
+    "'Terrain', 'Paths', 'Scenery', 'Coasters', 'Rides'."
 )
 
 PROMPT_TEMPLATE = """Convert the following normalized park LAYOUT into an ordered
@@ -57,7 +63,24 @@ Scaling & Fidelity Instructions:
   2. Spacing: Ensure buildings, rides, and coaster tracks have sufficient spacing so they do not clip or overlap.
   3. Coasters: Scale track node coordinates, but avoid making track elements or turns too tight or short, as game clearance limits require smooth shapes. Adjust the banking and heights to keep it looking realistic.
 
-Emit actions in this build order: terrain, then paths, then buildings, then
+Built-In Asset & Menu Rules:
+- The game only has standard built-in assets and themed pieces (Medieval/Fantasy, Adventure, Sci-Fi, Western, etc.). You MUST map custom/real-world landmark structures and rides to generic/standard piece names and ride/coaster types already in the game (e.g., use "Castle Tower" or "Castle Wall" instead of "Hogwarts Castle", "Adventure Temple" instead of "Jurassic Park Discovery Center", "B&M Wing Coaster" instead of "The Incredible Hulk Coaster", "Drop Tower" instead of "Doctor Doom's Fearfall").
+- For the "select_menu" action, you MUST use one of the exact menu names: "Terrain", "Paths", "Scenery", "Coasters", or "Rides". (Do not use "Buildings", "Building", "Scenery/Buildings", etc.)
+
+Terrain, Painting, and Water Rules:
+- To shape terrain (e.g., carving trenches, flattening ground, raising hills), emit a `select_menu` for "Terrain", then a `select_piece` action with the name of the tool (e.g., "Flatten Tool", "Push/Raise Tool", "Pull/Lower Tool", "Smooth Tool"), followed by one or more `sculpt_terrain` actions.
+- To apply materials or textures (e.g., painting sand, dirt, rock, grass), emit a `select_menu` for "Terrain", then a `select_piece` action with the name of the texture/material (e.g., "Sand Texture", "Dirt Texture", "Rock Texture"), followed by one or more `sculpt_terrain` actions.
+- To place water features (e.g., lakes, rivers, ponds), emit a `select_menu` for "Terrain", then a `select_piece` action with the name of the water tool (e.g., "Water Tool" or "Calm Water"), followed by `place_piece` or `sculpt_terrain` actions.
+- After every `select_piece`, emit a `wait` of at least 1.5 seconds to give the operator time to complete the menu search interaction before the next build action fires.
+
+Camera Navigation Rules (IMPORTANT):
+- The game camera does NOT move automatically. Before any cluster of build actions in a new area, you MUST emit camera actions to navigate there first.
+- Use `zoom_camera` to set the overhead zoom level: emit it at the start of the plan and whenever moving to a distant area.
+- Use `pan_camera` (with direction: "forward", "backward", "left", "right") to move the camera horizontally. Each `pan_camera` should have a "duration" field (seconds to hold the key, e.g. 0.5-2.0s). Follow every `pan_camera` with a `wait` of 0.3s.
+- Before each zone's build actions, emit 2-4 `pan_camera` actions to position the camera over that zone, then a `zoom_camera` to set the right zoom level.
+- Example camera navigation before a zone: zoom out first, pan to the zone location, zoom back in to a comfortable level.
+
+Emit actions in this build order: camera setup, then terrain, then paths, then buildings, then
 coaster track, then rides/theming. Use ONLY these action objects:
 
 - {{"type":"select_menu","menu": string}}
@@ -66,12 +89,44 @@ coaster track, then rides/theming. Use ONLY these action objects:
 - {{"type":"place_track_node","x": number,"y": number,"z": number,"banking": number}}
 - {{"type":"sculpt_terrain","x": number,"y": number,"strength": number,"radius": number}}
 - {{"type":"place_path","x1": number,"y1": number,"x2": number,"y2": number,"width": number}}
+- {{"type":"pan_camera","direction": string,"duration": number}}
+- {{"type":"zoom_camera","direction": string,"clicks": number}}
 - {{"type":"rotate_camera","dx": number,"dy": number}}
 - {{"type":"wait","seconds": number}}
 - {{"type":"note","text": string}}
 
-Return ONLY a JSON array of action objects.
+CRITICAL OUTPUT FORMAT: Your entire response MUST be a single JSON array that starts
+with '[' and ends with ']'. Do NOT wrap it in an object like {{"plan": [...]}}.
+Do NOT include any text before or after the JSON array.
 """
+
+# Common wrapper keys models use instead of returning a bare array
+_WRAPPER_KEYS = ("plan", "actions", "build_plan", "steps", "build_actions", "result", "output")
+
+
+def _unwrap_plan(raw: Any) -> Any:
+    """If the model wrapped the array in an object, extract the array.
+
+    Models (especially with JSON mode active) frequently return::
+
+        {"plan": [{...}, ...]}   or   {"actions": [{...}, ...]}
+
+    instead of a bare ``[{...}, ...]``.  This helper peeks inside and pulls
+    out the first list value it finds under any known wrapper key.
+    """
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        # Check known wrapper keys first
+        for key in _WRAPPER_KEYS:
+            if key in raw and isinstance(raw[key], list):
+                return raw[key]
+        # Fall back: return the first list value we find
+        for val in raw.values():
+            if isinstance(val, list):
+                return val
+    return raw  # Return as-is; validate_plan will report the problem
+
 
 
 def compute_scale(layout: dict[str, Any], ingame: dict[str, Any]) -> dict[str, float]:
@@ -139,9 +194,23 @@ def generate_plan(
         guidance_section=guidance_section,
     )
     plan = call_model(prompt, system=SYSTEM, expect_json=True, cfg=cfg)
+    plan = _unwrap_plan(plan)
     problems = validate_plan(plan)
     if problems:
-        raise ValueError("Planner produced an invalid plan:\n- " + "\n- ".join(problems))
+        # One-shot retry: explicitly ask for a bare JSON array
+        retry_prompt = (
+            "Your previous response was not a valid JSON array of build actions.\n"
+            "Problems detected:\n- " + "\n- ".join(problems) + "\n\n"
+            "OUTPUT REQUIREMENT: Respond with ONLY a JSON array that starts with '[' "
+            "and ends with ']'. Each element must be an action object with a 'type' field. "
+            "Do not wrap it in an object. Do not include any explanation.\n\n"
+            "Original task:\n" + prompt
+        )
+        plan = call_model(retry_prompt, system=SYSTEM, expect_json=True, cfg=cfg)
+        plan = _unwrap_plan(plan)
+        problems = validate_plan(plan)
+        if problems:
+            raise ValueError("Planner produced an invalid plan:\n- " + "\n- ".join(problems))
     return plan
 
 

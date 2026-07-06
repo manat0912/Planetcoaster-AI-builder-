@@ -32,7 +32,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "gemini_api_key": "",
     "openai_api_key": "",
     "openai_base_url": "https://api.openai.com/v1",
-    "max_output_tokens": 8192,
+    "max_output_tokens": 32768,
     "temperature": 0.4,
 }
 
@@ -94,8 +94,69 @@ def _encode_image(path: str) -> tuple[str, str]:
     return data, media_type
 
 
+def _repair_truncated_json(text: str) -> Any:
+    """Attempt to fix a truncated JSON string by progressively trimming the tail
+    until we find a valid JSON prefix. Works by closing open structures greedily."""
+    # Walk backwards looking for the last position where we can close all open braces/brackets
+    stack = []
+    in_string = False
+    escape_next = False
+    for i, ch in enumerate(text):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == "\\" and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in ('{', '['):
+            stack.append(ch)
+        elif ch == '}':
+            if stack and stack[-1] == '{':
+                stack.pop()
+        elif ch == ']':
+            if stack and stack[-1] == '[':
+                stack.pop()
+
+    # If nothing is unclosed just fail normally
+    if not stack:
+        raise ValueError("Could not repair JSON")
+
+    # Close unclosed structures and try parsing
+    closers = {'{': '}', '[': ']'}
+    tail = "".join(closers[c] for c in reversed(stack))
+
+    # Remove any trailing partial key/value and add closers
+    # Trim to last known-good boundary: last comma or last closing brace/bracket before truncation
+    candidates = []
+    for marker in (',', ':', '{', '['):
+        pos = text.rfind(marker)
+        if pos > 0:
+            candidates.append(pos)
+    trim_to = max(candidates) if candidates else len(text)
+    # Go back to the last complete value boundary
+    for pos in range(trim_to, 0, -1):
+        candidate = text[:pos].rstrip() + tail
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+    raise ValueError("Could not repair truncated JSON")
+
+
 def _extract_json(text: str) -> Any:
-    """Best-effort recovery of a JSON object/array embedded in model output."""
+    """Best-effort recovery of a JSON object/array embedded in model output.
+
+    Tries in order:
+    1. Direct parse
+    2. Strip ```json``` fences
+    3. Find first { } or [ ] blob
+    4. Repair truncated JSON by greedily closing open brackets
+    """
     text = text.strip()
     try:
         return json.loads(text)
@@ -116,6 +177,14 @@ def _extract_json(text: str) -> Any:
                 return json.loads(text[start : end + 1])
             except json.JSONDecodeError:
                 continue
+    # Last resort: try to repair truncated output
+    for opener in ("{", "["):
+        start = text.find(opener)
+        if start != -1:
+            try:
+                return _repair_truncated_json(text[start:])
+            except (ValueError, Exception):
+                pass
     raise ValueError("Model did not return valid JSON:\n" + text[:2000])
 
 
@@ -173,7 +242,7 @@ def _call_anthropic(cfg, model, prompt, images, system):
 
     resp = client.messages.create(
         model=model,
-        max_tokens=int(cfg.get("max_output_tokens", 8192)),
+        max_tokens=int(cfg.get("max_output_tokens", 32768)),
         temperature=float(cfg.get("temperature", 0.4)),
         system=system or "",
         messages=[{"role": "user", "content": content}],
@@ -198,16 +267,61 @@ def _call_gemini(cfg, model, prompt, images, system):
         parts.append(types.Part.from_bytes(data=base64.b64decode(data), mime_type=media_type))
     parts.append(types.Part.from_text(text=prompt))
 
-    resp = client.models.generate_content(
-        model=model,
-        contents=parts,
-        config=types.GenerateContentConfig(
+    max_tok = int(cfg.get("max_output_tokens", 32768))
+
+    def _do_generate(extra_config=None):
+        kw = dict(
             system_instruction=system or None,
             temperature=float(cfg.get("temperature", 0.4)),
-            max_output_tokens=int(cfg.get("max_output_tokens", 8192)),
-        ),
-    )
-    return resp.text or ""
+            max_output_tokens=max_tok,
+        )
+        if extra_config:
+            kw.update(extra_config)
+        return client.models.generate_content(
+            model=model,
+            contents=parts,
+            config=types.GenerateContentConfig(**kw),
+        )
+
+    # Try with JSON output mode first; fall back if the model/version rejects it
+    try:
+        resp = _do_generate({"response_mime_type": "application/json"})
+    except Exception:
+        resp = _do_generate()
+
+    text = resp.text or ""
+
+    # Detect truncation: if finish_reason is MAX_TOKENS the JSON is incomplete.
+    # Ask the model to continue from where it stopped.
+    try:
+        finish_reason = resp.candidates[0].finish_reason
+        is_truncated = str(finish_reason) in ("MAX_TOKENS", "2", "FinishReason.MAX_TOKENS")
+    except Exception:
+        is_truncated = False
+
+    if is_truncated:
+        continuation_prompt = (
+            "The previous JSON response was cut off mid-output due to length limits. "
+            "Continue EXACTLY from where it stopped. Output ONLY the remaining JSON, "
+            "starting from the exact character where the previous output ended. "
+            "Do not repeat any already-output text.\n\nPrevious output ended with:\n"
+            + text[-400:]
+        )
+        try:
+            cont_resp = client.models.generate_content(
+                model=model,
+                contents=[types.Part.from_text(text=continuation_prompt)],
+                config=types.GenerateContentConfig(
+                    temperature=float(cfg.get("temperature", 0.4)),
+                    max_output_tokens=max_tok,
+                    response_mime_type="application/json",
+                ),
+            )
+            text = text + (cont_resp.text or "")
+        except Exception:
+            pass  # Use the partial response; _repair_truncated_json will handle it
+
+    return text
 
 
 def _call_openai(cfg, model, prompt, images, system):

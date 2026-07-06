@@ -76,11 +76,17 @@ class ControllerConfig:
 
 
 def _pyautogui():
-    import pyautogui
-
-    pyautogui.FAILSAFE = True
-    pyautogui.PAUSE = 0.0
-    return pyautogui
+    """Return the best available input library (pydirectinput preferred for games)."""
+    try:
+        import pydirectinput
+        pydirectinput.FAILSAFE = True
+        pydirectinput.PAUSE = 0.0
+        return pydirectinput
+    except ImportError:
+        import pyautogui
+        pyautogui.FAILSAFE = True
+        pyautogui.PAUSE = 0.0
+        return pyautogui
 
 
 def _focus_window_by_title(target_title: str) -> bool:
@@ -194,7 +200,7 @@ def execute_plan(
             log(f"[error] action #{i} ({atype}): {exc}")
 
         if config.action_delay:
-            time.sleep(config.action_delay if not config.dry_run else 0)
+            time.sleep(config.action_delay)
 
     # If build completed fully, clear the resume state
     if memory is not None and hasattr(memory, "clear_state"):
@@ -210,6 +216,14 @@ def execute_plan(
     }
     log(f"[done] {summary}")
     return summary
+
+
+def set_clipboard(text: str):
+    import subprocess
+    try:
+        subprocess.run("clip", input=text, text=True, check=True)
+    except Exception:
+        pass
 
 
 def _dispatch(action, atype, gui, proj, config, log) -> bool:
@@ -238,6 +252,8 @@ def _dispatch(action, atype, gui, proj, config, log) -> bool:
             "Terrain": config.controls.get("menu_terrain", "t"),
             "Paths": config.controls.get("menu_paths", "p"),
             "Scenery": config.controls.get("menu_scenery", "b"),
+            "Buildings": config.controls.get("menu_scenery", "b"),
+            "Building": config.controls.get("menu_scenery", "b"),
             "Coasters": config.controls.get("menu_coasters", "r"),
             "Rides": config.controls.get("menu_rides", "y"),
         }
@@ -245,11 +261,19 @@ def _dispatch(action, atype, gui, proj, config, log) -> bool:
         log(f"[menu] {menu} -> key '{key}'")
         if not dry and key:
             gui.press(key)
+            time.sleep(0.8)  # wait for menu panel to open
         return bool(key)
 
     if atype == "select_piece":
-        log(f"[piece] select {action.get('name')}")
-        return False  # piece selection is UI-specific; logged for the operator
+        name = action.get("name", "")
+        log(f"[piece] select {name}")
+        if not dry:
+            set_clipboard(name)
+            # Give the user 10 seconds to search and click the piece in the UI.
+            # The name is on the clipboard so they can Ctrl+V into the search box.
+            log(f"[operator-action] PAUSED - Search for '{name}' in the game menu (Ctrl+V to paste). Resuming in 10 seconds...")
+            time.sleep(10.0)
+        return True
 
     if atype == "key":
         key = action.get("key", "")
@@ -279,15 +303,21 @@ def _dispatch(action, atype, gui, proj, config, log) -> bool:
         dx, dy = int(action.get("dx", 0)), int(action.get("dy", 0))
         log(f"[camera] rotate ({dx},{dy})")
         if not dry:
-            gui.moveRel(dx, dy, duration=config.move_duration)
+            # Drag with middle mouse button to rotate camera in Planet Coaster
+            gui.dragRel(dx, dy, duration=config.move_duration, button="middle")
         return True
 
     if atype == "place_piece":
         px, py = proj.to_screen(float(action["x"]), float(action["y"]))
         log(f"[place] {action.get('name')} @unit({action['x']},{action['y']},{action['z']}) -> px({px},{py})")
         if not dry:
+            # Press Escape to exit any previous placement/selection mode
+            gui.press("escape")
+            time.sleep(0.3)
             gui.moveTo(px, py, duration=config.move_duration)
+            time.sleep(0.1)
             gui.click()
+            time.sleep(0.5)  # let game place the piece
         return True
 
     if atype == "place_track_node":
@@ -295,15 +325,30 @@ def _dispatch(action, atype, gui, proj, config, log) -> bool:
         log(f"[track] node @unit({action['x']},{action['y']},{action['z']}) bank={action['banking']} -> px({px},{py})")
         if not dry:
             gui.moveTo(px, py, duration=config.move_duration)
+            time.sleep(0.1)
             gui.click()
+            time.sleep(0.4)  # let the game register the track node
         return True
 
     if atype == "sculpt_terrain":
         px, py = proj.to_screen(float(action["x"]), float(action["y"]))
-        log(f"[terrain] sculpt @unit({action['x']},{action['y']}) str={action['strength']} r={action['radius']} -> px({px},{py})")
+        radius = float(action.get("radius", 4.0))
+        strength = float(action.get("strength", 0.5))
+        log(f"[terrain] sculpt @unit({action['x']},{action['y']}) str={strength} r={radius} -> px({px},{py})")
         if not dry:
+            # Terrain painting: move to position, hold left mouse button and sweep
+            # a horizontal stroke. The game applies the brush while the button is held.
             gui.moveTo(px, py, duration=config.move_duration)
-            gui.click()
+            time.sleep(0.1)
+            # Stroke width proportional to radius in units (~6 px per unit is a rough default)
+            stroke_px = max(20, int(radius * 6))
+            gui.mouseDown(button="left")
+            time.sleep(0.05)
+            gui.moveRel(stroke_px, 0, duration=0.3)
+            gui.moveRel(-stroke_px * 2, 0, duration=0.3)
+            gui.moveRel(stroke_px, 0, duration=0.15)
+            gui.mouseUp(button="left")
+            time.sleep(0.2)
         return True
 
     if atype == "place_path":
@@ -311,8 +356,17 @@ def _dispatch(action, atype, gui, proj, config, log) -> bool:
         x2, y2 = proj.to_screen(float(action["x2"]), float(action["y2"]))
         log(f"[path] w={action.get('width')} unit->px ({x1},{y1})->({x2},{y2})")
         if not dry:
+            # Press Escape first to clear any pending selection/placement mode
+            gui.press("escape")
+            time.sleep(0.3)
+            # Click start point to begin path segment
             gui.moveTo(x1, y1, duration=config.move_duration)
-            gui.dragTo(x2, y2, duration=config.move_duration * 2, button="left")
+            gui.click()
+            time.sleep(0.5)  # let game register the start point
+            # Click end point to complete the path segment
+            gui.moveTo(x2, y2, duration=config.move_duration)
+            gui.click()
+            time.sleep(0.5)  # let game confirm placement
         return True
 
     if atype == "pan_camera":
