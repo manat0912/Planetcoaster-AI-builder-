@@ -53,6 +53,8 @@ class ParkSpatialMemory:
         ]
         self.current_sector: Tuple[int, int] = (0, 0)
         self._load()
+        if not MEMORY_FILE.exists():
+            self.save()
 
     # ── persistence ──────────────────────────────────────────────────────────
 

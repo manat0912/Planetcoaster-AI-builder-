@@ -445,15 +445,19 @@ matching this exact schema:
 }
 
 Rules:
-- Choose TERRAIN_SCULPT to raise/lower/flatten land. Pick the best sculpt_mode.
-- Choose TERRAIN_PAINT to apply textures (sand, grass, dirt, rock, cobblestone…).
-- Choose TERRAIN_WATER to place water bodies.
-- Choose ASSET_SEARCH to find and select a scenery/building piece from the menu.
-- Choose OBJECT_PLACEMENT to drop the currently-selected piece at a coordinate.
-- Choose MAP_NAVIGATE to pan/zoom the camera to a new area.
-- All coordinates are normalised 0.0–1.0 relative to the screen.
-- Set status=AREA_FINISHED when the current sector looks complete.
-- Output ONLY the JSON object — no explanation, no markdown fences.
+1. Spatial Grid Mapping: The SPATIAL MEMORY represents the 2D sandbox workspace of your park as an 8x8 grid. Row 0 is North/Top, Column 0 is West/Left.
+2. Current Objective: The sector marked with `(cursor=row,col)` is your current focus and has status `I` (In Progress). Your actions MUST focus on building the corresponding part of the REFERENCE image that belongs in this sector.
+3. Advance When Ready: Once you have sculpted terrain, painted textures, placed water, paths, or scenery for the current sector to match the reference, you MUST set `"status": "AREA_FINISHED"` in your JSON response. This triggers the system to lock in progress, run audit sweeps, and advance the cursor to the next empty sector.
+4. Keep Building: If you still have more elements (sculpting, painting, or placement) to do in the current sector, set `"status": "CONTINUE_IN_AREA"`.
+5. Action Details:
+   - Choose TERRAIN_SCULPT to raise/lower/flatten land. Pick the best sculpt_mode.
+   - Choose TERRAIN_PAINT to apply textures (sand, grass, dirt, rock, cobblestone…).
+   - Choose TERRAIN_WATER to place water bodies.
+   - Choose ASSET_SEARCH to find and select a scenery/building piece from the menu.
+   - Choose OBJECT_PLACEMENT to drop the currently-selected piece at a coordinate.
+   - Choose MAP_NAVIGATE to pan/zoom the camera to a new area.
+   - All coordinates are normalised 0.0–1.0 relative to the screen.
+6. Output Format: Output ONLY the JSON object — no explanation, no markdown fences.
 """
 
 
@@ -463,6 +467,7 @@ def query_gemini(
     current_screen_path: str,
     memory_string: str,
     model: str = "gemini-2.5-flash",
+    system_hint: str = "",
 ) -> dict[str, Any]:
     from google.genai import types
 
@@ -474,9 +479,12 @@ def query_gemini(
     parts.append(types.Part.from_bytes(
         Path(current_screen_path).read_bytes(), mime_type="image/png"
     ))
-    parts.append(
-        f"{AUTONOMOUS_SCHEMA_DESCRIPTION}\n\nSPATIAL MEMORY:\n{memory_string}"
-    )
+    
+    prompt = f"{AUTONOMOUS_SCHEMA_DESCRIPTION}\n\nSPATIAL MEMORY:\n{memory_string}"
+    if system_hint:
+        prompt += f"\n\nSYSTEM WARNING/HINT:\n{system_hint}"
+        
+    parts.append(prompt)
 
     resp = client.models.generate_content(
         model=model,
@@ -531,12 +539,17 @@ def run_autonomous(
     memory = ParkSpatialMemory()
     client = _build_gemini_client(gemini_api_key)
 
+    # Initialize the starting sector as In Progress
+    cr, cc = memory.current_sector
+    memory.mark_in_progress(cr, cc)
+
     log(f"[autonomous] Starting. Input backend: {_INPUT}. Dry-run: {dry_run}.")
     if reference_image:
         log(f"[autonomous] Reference image: {reference_image}")
 
     iteration = 0
     areas_completed = 0
+    steps_in_current_sector = 0
 
     while iteration < max_iterations:
         if ABORT or stop():
@@ -544,12 +557,23 @@ def run_autonomous(
             break
 
         iteration += 1
-        log(f"\n─── Iteration {iteration}/{max_iterations} ───")
+        steps_in_current_sector += 1
+        cr, cc = memory.current_sector
+        log(f"\n─── Iteration {iteration}/{max_iterations} (Sector {cr},{cc}, Step {steps_in_current_sector}) ───")
 
         # 1. Capture screen
         screen_path = capture_screen()
 
-        # 2. Ask Gemini
+        # 2. Build system warning / hint to guide the LLM if it's taking too long
+        system_hint = ""
+        if steps_in_current_sector >= 10:
+            system_hint = (
+                f"You have spent {steps_in_current_sector} steps in the current sector ({cr},{cc}). "
+                "If the essential work here (terrain sculpting, texturing, basic structures) is done, "
+                "please transition by setting \"status\": \"AREA_FINISHED\" so we can move to the next sector."
+            )
+
+        # 3. Ask Gemini
         try:
             cmd = query_gemini(
                 client,
@@ -557,21 +581,26 @@ def run_autonomous(
                 current_screen_path=screen_path,
                 memory_string=memory.to_gemini_string(),
                 model=gemini_model,
+                system_hint=system_hint,
             )
         except Exception as exc:
             log(f"[gemini] Error: {exc}")
             time.sleep(2.0)
             continue
 
-        # 3. Execute the action
+        # 4. Execute the action
         try:
             execute_command(cmd, log=log, dry=dry_run)
         except Exception as exc:
             log(f"[execute] Error: {exc}")
 
-        # 4. Area-finished transition
+        # 5. Safety boundary check: force-advance if stuck too long in one sector
+        if steps_in_current_sector >= 18:
+            log(f"[memory] Sector ({cr},{cc}) reached build limit ({steps_in_current_sector} steps). Force-advancing to next area.")
+            cmd["status"] = "AREA_FINISHED"
+
+        # 6. Area-finished transition
         if cmd.get("status") == "AREA_FINISHED":
-            cr, cc = memory.current_sector
             log(f"[memory] Sector ({cr},{cc}) finished. Running audit…")
 
             if not dry_run:
@@ -582,6 +611,7 @@ def run_autonomous(
 
             memory.register_complete(cr, cc)
             areas_completed += 1
+            steps_in_current_sector = 0  # reset for next sector
 
             next_sec = memory.get_next_empty_sector()
             if next_sec is None:
